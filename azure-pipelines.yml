@@ -5,18 +5,82 @@ pool:
   vmImage: ubuntu-latest
 
 variables:
-  IMAGE_NAME: hello-flask
-  ACR_NAME: msanchiacr
+  # ACR
   ACR_LOGIN_SERVER: msanchiacr.azurecr.io
+  IMAGE_NAME: hello-flask
+  CONTAINER_NAME: hello-flask
 
-steps:
-- task: Docker@2
-  displayName: Build and push image to ACR
-  inputs:
-    containerRegistry: 'msanchiacr-connection'
-    repository: $(IMAGE_NAME)
-    command: buildAndPush
-    Dockerfile: Dockerfile
-    tags: |
-      $(Build.BuildId)
-    arguments: --platform linux/amd64
+  # App ports
+  HOST_PORT: 80
+  CONTAINER_PORT: 5001
+
+  # VM SSH
+  VM_HOST: 52.157.242.191
+  VM_USER: azureuser
+
+stages:
+- stage: BuildAndPush
+  displayName: Build & Push image
+  jobs:
+  - job: BuildPush
+    displayName: Build and push to ACR
+    steps:
+    - checkout: self
+
+    - task: Docker@2
+      displayName: Build and push
+      inputs:
+        command: buildAndPush
+        repository: $(IMAGE_NAME)
+        dockerfile: Dockerfile
+        containerRegistry: acr-msanchiacr   # <-- your service connection name
+        tags: |
+          $(Build.BuildId)
+          latest
+
+- stage: Deploy
+  displayName: Deploy to VM
+  dependsOn: BuildAndPush
+  jobs:
+  - job: DeployVM
+    displayName: SSH and run container on VM
+    steps:
+    - task: DownloadSecureFile@1
+      name: sshkey
+      displayName: Download SSH key
+      inputs:
+        secureFile: vm-flask-devops_key.pem   # <-- must match your secure file name exactly
+
+    - script: |
+        set -e
+        chmod 600 "$(sshkey.secureFilePath)"
+
+        echo "Deploying to VM..."
+        ssh -i "$(sshkey.secureFilePath)" -o StrictHostKeyChecking=no $(VM_USER)@$(VM_HOST) << 'EOF'
+          set -e
+
+          echo "Login to ACR..."
+          sudo docker login msanchiacr.azurecr.io -u msanchiacr --password-stdin << PWD
+$(ACR_ADMIN_PASSWORD)
+PWD
+
+          echo "Pull image..."
+          sudo docker pull msanchiacr.azurecr.io/hello-flask:$(Build.BuildId)
+
+          echo "Stop old container if exists..."
+          sudo docker rm -f hello-flask || true
+
+          echo "Run new container..."
+          sudo docker run -d --name hello-flask \
+            -p 80:5001 \
+            --restart unless-stopped \
+            msanchiacr.azurecr.io/hello-flask:$(Build.BuildId)
+
+          echo "Containers:"
+          sudo docker ps
+
+          echo "Health check:"
+          curl -s http://localhost/health || true
+        EOF
+      displayName: Deploy (docker run)
+
