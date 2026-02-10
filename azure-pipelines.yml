@@ -1,71 +1,121 @@
+# azure-pipelines.yml
+# Build Docker image -> Push to ACR -> SSH to Azure VM -> Pull & run container
+# Repo: msanchi08/hello-flask-azure
+
 trigger:
-- main
+  branches:
+    include:
+      - main
 
 pool:
   vmImage: ubuntu-latest
 
 variables:
-  IMAGE_NAME: hello-flask
-  CONTAINER_NAME: hello-flask
+  # ---- ACR ----
+  ACR_LOGIN_SERVER: 'msanchiacr.azurecr.io'
+  IMAGE_NAME: 'hello-flask'
+  IMAGE_TAG: '$(Build.BuildId)'
 
-  ACR_LOGIN_SERVER: msanchiacr.azurecr.io
-  ACR_USERNAME: msanchiacr
+  # ---- VM ----
+  VM_HOST: '52.157.242.191'
+  VM_USER: 'azureuser'
 
-  VM_USER: azureuser
-  VM_HOST: 52.157.242.191
+  # ---- Container ----
+  CONTAINER_NAME: 'hello-flask'
+  CONTAINER_PORT: '5001'   # container listens on 5001 (your app.py)
+  HOST_PORT: '80'          # public port on VM
 
-  HOST_PORT: "80"
-  CONTAINER_PORT: "5001"
+stages:
+- stage: BuildAndDeploy
+  displayName: Build, Push, Deploy
+  jobs:
+  - job: BuildPushDeploy
+    displayName: Build & Push & Deploy
+    steps:
+    - checkout: self
 
-steps:
-- checkout: self
-  displayName: "Checkout source"
+    # (Optional) Debug - shows non-secret vars to confirm pipeline sees them
+    - script: |
+        echo "ACR_LOGIN_SERVER=$(ACR_LOGIN_SERVER)"
+        echo "IMAGE_NAME=$(IMAGE_NAME)"
+        echo "IMAGE_TAG=$(IMAGE_TAG)"
+        echo "VM_USER=$(VM_USER)"
+        echo "VM_HOST=$(VM_HOST)"
+      displayName: 'Debug (no secrets)'
 
-# 1) Login to ACR from the build agent
-- script: |
-    set -e
-    echo "Login to ACR from pipeline agent..."
-    echo "$ACR_PASSWORD" | docker login "$(ACR_LOGIN_SERVER)" -u "$(ACR_USERNAME)" --password-stdin
-  displayName: "Docker login to ACR (agent)"
-  env:
-    ACR_PASSWORD: $(ACR_PASSWORD)
+    # 1) Docker login to ACR from agent (uses secret ACR_PASSWORD)
+    - script: |
+        set -e
+        echo "Login to ACR from pipeline agent..."
+        echo "$ACR_PASSWORD" | docker login "$(ACR_LOGIN_SERVER)" -u "$(ACR_USERNAME)" --password-stdin
+      displayName: 'Docker login to ACR (agent)'
+      env:
+        ACR_USERNAME: $(ACR_USERNAME)
+        ACR_PASSWORD: $(ACR_PASSWORD)
 
+    # 2) Build & push image to ACR
+    - script: |
+        set -e
+        echo "Build image..."
+        docker build -t "$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)" .
 
-# 2) Build and Push image to ACR
-- script: |
-    set -e
-    echo "Build image..."
-    docker build -t "$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)" .
+        echo "Push image..."
+        docker push "$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(IMAGE_TAG)"
+      displayName: 'Build & Push image to ACR'
 
-    echo "Push image..."
-    docker push "$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)"
-  displayName: "Build & Push image to ACR"
+    # 3) Download SSH key (Secure file in Azure DevOps Library)
+    - task: DownloadSecureFile@1
+      name: sshkey
+      inputs:
+        secureFile: 'vm-flask-devops_key.pem'
+      displayName: 'Download SSH key (secure file)'
 
-# 3) Download SSH key from Secure files
-- task: DownloadSecureFile@1
-  name: sshkey
-  inputs:
-    secureFile: vm-flask-devops_key.pem
-  displayName: "Download VM SSH key"
+    # 4) SSH into VM and deploy (login -> pull -> run)
+    - script: |
+        set -e
 
-# 4) SSH to VM and run container
-- script: |
-    set -e
-    chmod 600 "$(sshkey.secureFilePath)"
+        echo "Preparing SSH key..."
+        chmod 600 "$(sshkey.secureFilePath)"
 
-    ssh -i "$(sshkey.secureFilePath)" -o StrictHostKeyChecking=no "$(VM_USER)@$(VM_HOST)" "
-      set -e
-      echo '$ACR_PASSWORD' | sudo docker login '$(ACR_LOGIN_SERVER)' -u '$(ACR_USERNAME)' --password-stdin
-      sudo docker pull '$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)'
-      sudo docker rm -f '$(CONTAINER_NAME)' || true
-      sudo docker run -d --name '$(CONTAINER_NAME)' \
-        -p $(HOST_PORT):$(CONTAINER_PORT) \
-        --restart unless-stopped \
-        '$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)'
-      sudo docker ps
-      curl -s http://localhost/health || true
-    "
-  displayName: "Deploy to Azure VM (docker run)"
-  env:
-    ACR_PASSWORD: $(ACR_PASSWORD)
+        echo "Deploying on VM via SSH..."
+        ssh -i "$(sshkey.secureFilePath)" -o StrictHostKeyChecking=no $(VM_USER)@$(VM_HOST) << 'EOF'
+          set -e
 
+          echo "Docker login to ACR on VM..."
+          echo "$ACR_PASSWORD" | sudo docker login "$ACR_LOGIN_SERVER" -u "$ACR_USERNAME" --password-stdin
+
+          echo "Pull image..."
+          sudo docker pull "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG"
+
+          echo "Stop old container if exists..."
+          sudo docker rm -f "$CONTAINER_NAME" || true
+
+          echo "Run new container..."
+          sudo docker run -d --name "$CONTAINER_NAME" \
+            -p "$HOST_PORT:$CONTAINER_PORT" \
+            --restart unless-stopped \
+            "$ACR_LOGIN_SERVER/$IMAGE_NAME:$IMAGE_TAG"
+
+          echo "Show running containers:"
+          sudo docker ps
+
+          echo "Health check (localhost on VM):"
+          curl -s http://localhost/health || true
+          echo ""
+        EOF
+      displayName: 'Deploy to Azure VM (docker run)'
+      env:
+        # Pass secrets + values into the SSH session
+        ACR_LOGIN_SERVER: $(ACR_LOGIN_SERVER)
+        ACR_USERNAME: $(ACR_USERNAME)
+        ACR_PASSWORD: $(ACR_PASSWORD)
+
+        IMAGE_NAME: $(IMAGE_NAME)
+        IMAGE_TAG: $(IMAGE_TAG)
+
+        CONTAINER_NAME: $(CONTAINER_NAME)
+        CONTAINER_PORT: $(CONTAINER_PORT)
+        HOST_PORT: $(HOST_PORT)
+
+        VM_USER: $(VM_USER)
+        VM_HOST: $(VM_HOST)
