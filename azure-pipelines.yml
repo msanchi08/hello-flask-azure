@@ -25,8 +25,11 @@ steps:
 - script: |
     set -e
     echo "Login to ACR from pipeline agent..."
-    echo "$(ACR_PASSWORD)" | docker login "$(ACR_LOGIN_SERVER)" -u "$(ACR_USERNAME)" --password-stdin
+    echo "$ACR_PASSWORD" | docker login "$(ACR_LOGIN_SERVER)" -u "$(ACR_USERNAME)" --password-stdin
   displayName: "Docker login to ACR (agent)"
+  env:
+    ACR_PASSWORD: $(ACR_PASSWORD)
+
 
 # 2) Build and Push image to ACR
 - script: |
@@ -48,32 +51,21 @@ steps:
 # 4) SSH to VM and run container
 - script: |
     set -e
-    echo "Prepare SSH key permissions..."
     chmod 600 "$(sshkey.secureFilePath)"
 
-    echo "Deploy on VM..."
     ssh -i "$(sshkey.secureFilePath)" -o StrictHostKeyChecking=no "$(VM_USER)@$(VM_HOST)" "
       set -e
-
-      echo 'Login to ACR from VM...'
-      echo \"$(ACR_PASSWORD)\" | sudo docker login \"$(ACR_LOGIN_SERVER)\" -u \"$(ACR_USERNAME)\" --password-stdin
-
-      echo 'Pull new image...'
-      sudo docker pull \"$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)\"
-
-      echo 'Remove old container if exists...'
-      sudo docker rm -f \"$(CONTAINER_NAME)\" || true
-
-      echo 'Run new container...'
-      sudo docker run -d --name \"$(CONTAINER_NAME)\" \
+      echo '$ACR_PASSWORD' | sudo docker login '$(ACR_LOGIN_SERVER)' -u '$(ACR_USERNAME)' --password-stdin
+      sudo docker pull '$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)'
+      sudo docker rm -f '$(CONTAINER_NAME)' || true
+      sudo docker run -d --name '$(CONTAINER_NAME)' \
         -p $(HOST_PORT):$(CONTAINER_PORT) \
         --restart unless-stopped \
-        \"$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)\"
-
-      echo 'Containers now:'
+        '$(ACR_LOGIN_SERVER)/$(IMAGE_NAME):$(Build.BuildId)'
       sudo docker ps
-
-      echo 'Health check:'
       curl -s http://localhost/health || true
     "
   displayName: "Deploy to Azure VM (docker run)"
+  env:
+    ACR_PASSWORD: $(ACR_PASSWORD)
+
